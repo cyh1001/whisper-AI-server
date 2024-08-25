@@ -1,82 +1,71 @@
-import tempfile
-import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import torch
+import requests
+import tempfile
+import os
+from pydub import AudioSegment
 
 app = FastAPI()
 
-# 加载Whisper模型和处理器
-model_name = "openai/whisper-large-v3"
+# 加载Hugging Face的Whisper模型
+model_name = "openai/whisper-large-v3"  # 或 "openai/whisper-tiny" 根据需求选择
 processor = WhisperProcessor.from_pretrained(model_name)
 model = WhisperForConditionalGeneration.from_pretrained(model_name)
 
-# 如果有GPU,将模型移到GPU
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = model.to(device)
+if torch.cuda.is_available():
+    model = model.to("cuda")
 
-class AudioRequest(BaseModel):
-    url: str
+def split_into_sentences(text):
+    import re
+    sentences = re.split('(?<=[.!?]) +', text)
+    return [s.strip() for s in sentences if s.strip()]
 
-@app.post("/transcribe/")
-async def transcribe_audio(request: AudioRequest):
-    # 下载音频文件
+@app.post("/transcribe_fastapi/")
+async def transcribe_audio(url: str):
     try:
-        response = requests.get(request.url)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download audio: {str(e)}")
+        # 下载音频文件
+        response = requests.get(url)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_file:
+            temp_file.write(response.content)
+            temp_file_path = temp_file.name
 
-    # 将音频保存为临时文件
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_file:
-        temp_file.write(response.content)
-        temp_file_path = temp_file.name
+        # 将音频转换为16kHz采样率
+        audio = AudioSegment.from_mp3(temp_file_path)
+        audio = audio.set_frame_rate(16000)
+        audio.export(temp_file_path, format="wav")
 
-    try:
-        # 使用Whisper进行转录
-        input_features = processor(temp_file_path, return_tensors="pt").input_features.to(device)
+        # 使用Whisper模型转录
+        input_features = processor(audio.raw_data, sampling_rate=16000, return_tensors="pt").input_features
+        if torch.cuda.is_available():
+            input_features = input_features.to("cuda")
+
         predicted_ids = model.generate(input_features)
-        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
 
-        # 获取时间戳
-        forced_decoder_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
-        result = model.generate(
-            input_features,
-            forced_decoder_ids=forced_decoder_ids,
-            return_dict_in_generate=True,
-            output_scores=True,
-            max_new_tokens=448,
-        )
-
-        token_timestamps = result.token_timestamps.squeeze().tolist()
-
-        # 处理句级时间戳
-        sentences = []
-        current_sentence = {"text": "", "start": None, "end": None}
-        words = transcription.split()
+        # 处理句级时间戳（注意：这里我们只能提供近似的时间戳）
+        sentences = split_into_sentences(transcription[0])
+        total_duration = len(audio) / 1000  # 总时长（秒）
+        time_per_char = total_duration / len(transcription[0])
         
-        for i, word in enumerate(words):
-            if current_sentence["start"] is None:
-                current_sentence["start"] = token_timestamps[i]
-            
-            current_sentence["text"] += word + " "
-            current_sentence["end"] = token_timestamps[i]
-            
-            if word.strip().endswith((".", "!", "?")):
-                current_sentence["text"] = current_sentence["text"].strip()
-                sentences.append(current_sentence)
-                current_sentence = {"text": "", "start": None, "end": None}
-        
-        if current_sentence["text"]:
-            current_sentence["text"] = current_sentence["text"].strip()
-            sentences.append(current_sentence)
+        result = []
+        current_time = 0
+        for sentence in sentences:
+            start_time = current_time
+            end_time = current_time + len(sentence) * time_per_char
+            result.append({
+                "text": sentence,
+                "start": round(start_time, 2),
+                "end": round(end_time, 2)
+            })
+            current_time = end_time
 
-        return {"sentences": sentences}
-    
-    finally:
-        import os
+        # 清理临时文件
         os.unlink(temp_file_path)
+
+        return {"sentences": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
