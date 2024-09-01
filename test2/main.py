@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, HTTPException
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import torch
@@ -5,13 +6,29 @@ import requests
 import tempfile
 import os
 from pydub import AudioSegment
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
 # 加载Hugging Face的Whisper模型
-model_name = "openai/whisper-large-v3"  # 或 "openai/whisper-tiny" 根据需求选择
+model_name = "openai/whisper-tiny"  # 或 "openai/whisper-tiny" 根据需求选择
 processor = WhisperProcessor.from_pretrained(model_name)
 model = WhisperForConditionalGeneration.from_pretrained(model_name)
+
+# 加载预下载的Whisper模型
+# model_directory = "./openai/whisper-large-v3"  # 确保这与download_model.py中的保存目录相同
+# processor = WhisperProcessor.from_pretrained(model_directory)
+# model = WhisperForConditionalGeneration.from_pretrained(model_directory)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://podcasthighlight.com",
+                   "http://localhost:3000",
+                   ],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if torch.cuda.is_available():
     model = model.to("cuda")
